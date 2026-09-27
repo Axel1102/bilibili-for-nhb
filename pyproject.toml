@@ -1,0 +1,22 @@
+[project]
+name = "bilibili-for-nhb"
+version = "0.1.0"
+description = "Resumable Bilibili creator dataset pipeline for non-commercial research"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28,<0.29",
+    "openpyxl>=3.1,<4",
+    "pandas>=2.2,<3",
+    "playwright>=1.45,<2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.4,<9",
+    "pytest-asyncio>=0.21,<1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

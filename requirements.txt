@@ -1,0 +1,4 @@
+httpx>=0.28,<0.29
+openpyxl>=3.1,<4
+pandas>=2.2,<3
+playwright>=1.45,<2

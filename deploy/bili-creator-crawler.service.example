@@ -1,0 +1,19 @@
+[Unit]
+Description=Bilibili creator dataset crawler
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+Group=CHANGE_ME
+WorkingDirectory=/opt/bilibili-for-nhb
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/bilibili-for-nhb/.venv/bin/python scripts_lite/bili_creator_pipeline.py all --batch-index 0 --server-headless --cookie-file /etc/bilibili-for-nhb/bilibili.cookie
+Restart=on-failure
+RestartSec=20
+KillSignal=SIGINT
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target
