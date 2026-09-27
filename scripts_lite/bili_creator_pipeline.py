@@ -1081,23 +1081,36 @@ async def _fetch_danmaku(client: Any, detail: Dict[str, Any], video_dir: Path, a
     return all_rows
 
 
-async def _crawl_video(client: Any, creator_path: Path, catalog_video: Dict[str, Any], args: argparse.Namespace) -> None:
+def _video_complete_for_request(
+    creator_path: Path,
+    catalog_video: Dict[str, Any],
+    args: argparse.Namespace,
+) -> bool:
     key = _video_key(catalog_video)
     if not key:
-        return
+        return True
     video_dir = creator_path / "videos" / _slug(key, "unknown_video")
-    complete_path = video_dir / "complete.json"
-    complete = _read_json(complete_path, {}) or {}
+    complete = _read_json(video_dir / "complete.json", {}) or {}
     requested_comments = not args.skip_comments
     requested_subcomments = requested_comments and not args.skip_subcomments
     requested_danmaku = args.danmaku
-    complete_satisfies_request = bool(complete) and (
+    return bool(complete) and (
         (not requested_comments or complete.get("comments_completed"))
         and (not requested_subcomments or complete.get("subcomments_completed"))
         and (not requested_danmaku or complete.get("danmaku_completed"))
     )
-    if complete_satisfies_request:
+
+
+async def _crawl_video(client: Any, creator_path: Path, catalog_video: Dict[str, Any], args: argparse.Namespace) -> None:
+    key = _video_key(catalog_video)
+    if not key or _video_complete_for_request(creator_path, catalog_video, args):
         return
+
+    video_dir = creator_path / "videos" / _slug(key, "unknown_video")
+    complete_path = video_dir / "complete.json"
+    requested_comments = not args.skip_comments
+    requested_subcomments = requested_comments and not args.skip_subcomments
+    requested_danmaku = args.danmaku
 
     detail_path = video_dir / "detail.json"
     detail = _read_json(detail_path, None)
@@ -1158,10 +1171,25 @@ async def crawl_creators(client: Any, rows: Sequence[Dict[str, Any]], output_roo
             continue
         if args.max_videos_per_creator > 0:
             videos = videos[: args.max_videos_per_creator]
-        print(f"[{creator_index}/{len(rows)}] crawl uid={row.get('author_id')}: {len(videos)} videos")
-        for video_index, video in enumerate(videos, start=1):
+        pending_videos = [
+            video
+            for video in videos
+            if not _video_complete_for_request(creator_path, video, args)
+        ]
+        completed_count = len(videos) - len(pending_videos)
+        if not pending_videos:
+            print(
+                f"[{creator_index}/{len(rows)}] crawl skip complete "
+                f"uid={row.get('author_id')}: {completed_count}/{len(videos)} videos"
+            )
+            continue
+        print(
+            f"[{creator_index}/{len(rows)}] crawl resume uid={row.get('author_id')}: "
+            f"completed {completed_count}/{len(videos)}, remaining {len(pending_videos)}"
+        )
+        for video_index, video in enumerate(pending_videos, start=1):
             key = _video_key(video)
-            print(f"  [{video_index}/{len(videos)}] {key} {video.get('title', '')}")
+            print(f"  [remaining {video_index}/{len(pending_videos)}] {key} {video.get('title', '')}")
             try:
                 await _crawl_video(client, creator_path, video, args)
             except (KeyboardInterrupt, asyncio.CancelledError):

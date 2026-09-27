@@ -151,6 +151,24 @@ def test_normal_api_error_is_not_a_browser_shutdown() -> None:
     assert not pipeline._is_browser_session_closed_error(RuntimeError("risk control"))
 
 
+def test_video_resume_check_respects_requested_components(tmp_path: Path) -> None:
+    creator_path = tmp_path / "creator"
+    video = {"bvid": "BV123"}
+    complete_path = creator_path / "videos" / "BV123" / "complete.json"
+    pipeline._atomic_write_json(
+        complete_path,
+        {
+            "comments_completed": True,
+            "subcomments_completed": True,
+            "danmaku_completed": False,
+        },
+    )
+    args = SimpleNamespace(skip_comments=False, skip_subcomments=False, danmaku=True)
+    assert not pipeline._video_complete_for_request(creator_path, video, args)
+    args.danmaku = False
+    assert pipeline._video_complete_for_request(creator_path, video, args)
+
+
 @pytest.mark.asyncio
 async def test_comment_crawl_can_add_subcomments_on_a_later_run(tmp_path: Path) -> None:
     class FakeClient:
