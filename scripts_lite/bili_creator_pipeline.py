@@ -379,6 +379,57 @@ def _creator_dir(output_root: Path, row: Dict[str, Any]) -> Path:
     return output_root / "batches" / f"batch_{batch_index:03d}" / "creators" / f"{uid}_{author}"
 
 
+def _assign_creator_shards(
+    rows: Sequence[Dict[str, Any]],
+    weights: Sequence[int],
+    shard_count: int,
+) -> Tuple[List[List[Dict[str, Any]]], List[int]]:
+    if shard_count <= 0:
+        raise ValueError("shard_count must be greater than zero")
+    if len(rows) != len(weights):
+        raise ValueError("rows and weights must have the same length")
+    assignments: List[List[Tuple[int, Dict[str, Any]]]] = [
+        [] for _ in range(shard_count)
+    ]
+    loads = [0 for _ in range(shard_count)]
+    ordered = sorted(
+        enumerate(zip(rows, weights)),
+        key=lambda item: (-max(1, int(item[1][1])), item[0]),
+    )
+    for original_index, (row, raw_weight) in ordered:
+        weight = max(1, int(raw_weight))
+        target = min(range(shard_count), key=lambda index: (loads[index], index))
+        assignments[target].append((original_index, row))
+        loads[target] += weight
+    return (
+        [
+            [row for _, row in sorted(shard, key=lambda item: item[0])]
+            for shard in assignments
+        ],
+        loads,
+    )
+
+
+def _select_creator_shard(
+    rows: Sequence[Dict[str, Any]],
+    output_root: Path,
+    args: argparse.Namespace,
+) -> Tuple[List[Dict[str, Any]], List[int]]:
+    weights: List[int] = []
+    for row in rows:
+        creator_path = _creator_dir(output_root, row)
+        videos = _read_jsonl(creator_path / "videos.jsonl")
+        if args.max_videos_per_creator > 0:
+            videos = videos[: args.max_videos_per_creator]
+        pending_count = sum(
+            not _video_complete_for_request(creator_path, video, args)
+            for video in videos
+        )
+        weights.append(pending_count)
+    assignments, loads = _assign_creator_shards(rows, weights, args.shard_count)
+    return assignments[args.shard_index - 1], loads
+
+
 def _video_key(video: Dict[str, Any]) -> str:
     return str(video.get("bvid") or video.get("aid") or "").strip()
 
@@ -1258,6 +1309,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="persistent browser profile (default: <output-root>/state/browser_profile)",
     )
+    parser.add_argument(
+        "--shard-count",
+        type=int,
+        default=1,
+        help="split creators into this many balanced independent workers (default: 1)",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=1,
+        help="1-based worker shard to process (default: 1)",
+    )
     return parser
 
 
@@ -1274,6 +1337,10 @@ async def _run(args: argparse.Namespace) -> int:
         raise ValueError("retries must be greater than zero")
     if args.catalog_page_size <= 0 or args.catalog_page_size > 30:
         raise ValueError("catalog_page_size must be between 1 and 30")
+    if args.shard_count <= 0:
+        raise ValueError("shard_count must be greater than zero")
+    if args.shard_index <= 0 or args.shard_index > args.shard_count:
+        raise ValueError("shard_index must be between 1 and shard_count")
 
     def prepare() -> Dict[str, Any]:
         if args.input_xlsx is not None:
@@ -1312,6 +1379,17 @@ async def _run(args: argparse.Namespace) -> int:
     if not rows:
         print("No selected creators found.")
         return 1
+    if args.shard_count > 1:
+        rows, shard_loads = _select_creator_shard(rows, args.output_root, args)
+        estimated = shard_loads[args.shard_index - 1]
+        print(
+            f"creator shard {args.shard_index}/{args.shard_count}: "
+            f"{len(rows)} creators, estimated remaining weight {estimated}; "
+            f"all shard weights={shard_loads}"
+        )
+        if not rows:
+            print("This shard has no creators.")
+            return 0
 
     original_cwd = Path.cwd()
     os.chdir(PROJECT_ROOT)

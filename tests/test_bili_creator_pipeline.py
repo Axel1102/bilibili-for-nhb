@@ -169,6 +169,24 @@ def test_video_resume_check_respects_requested_components(tmp_path: Path) -> Non
     assert pipeline._video_complete_for_request(creator_path, video, args)
 
 
+def test_creator_shards_are_complete_unique_and_balanced() -> None:
+    rows = [{"author_id": str(index)} for index in range(8)]
+    weights = [20, 15, 10, 8, 7, 6, 4, 2]
+    assignments, loads = pipeline._assign_creator_shards(rows, weights, 3)
+    assigned_ids = [row["author_id"] for shard in assignments for row in shard]
+    assert sorted(assigned_ids) == [str(index) for index in range(8)]
+    assert len(assigned_ids) == len(set(assigned_ids))
+    assert max(loads) - min(loads) <= max(weights)
+
+
+def test_shard_arguments_are_one_based() -> None:
+    args = pipeline._build_parser().parse_args(
+        ["crawl", "--shard-count", "4", "--shard-index", "3"]
+    )
+    assert args.shard_count == 4
+    assert args.shard_index == 3
+
+
 @pytest.mark.asyncio
 async def test_comment_crawl_can_add_subcomments_on_a_later_run(tmp_path: Path) -> None:
     class FakeClient:
