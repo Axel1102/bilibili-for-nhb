@@ -59,7 +59,7 @@ uv run python scripts_lite/bili_creator_pipeline.py crawl \
 uv run python scripts_lite/bili_creator_stats.py --show unfinished
 ```
 
-### 3–4 进程并行采集
+### 多进程并行采集
 
 先用单进程完成 `catalog`，再启动并行采集。每个 worker 使用独立的 Chromium profile，脚本会根据各 UP 主剩余视频数自动均衡分片：
 
@@ -70,7 +70,7 @@ uv run python scripts_lite/bili_parallel_runner.py \
   --workers 3
 ```
 
-日志保存在 `<output-root>/state/parallel_logs/worker_*.log`。建议先使用 3 个 worker；4 个 worker 会进一步增加触发平台风控的概率。并行模式默认把每个 worker 的请求间隔调整为 3–6 秒。
+日志保存在 `<output-root>/state/parallel_logs/worker_*.log`。`--workers` 没有硬性上限，但进程越多，服务器内存和 CPU 占用越高，也越容易触发平台风控；建议逐步从 3 个增加。并行模式默认把每个 worker 的请求间隔调整为 3–6 秒。
 
 可用 `all` 代替 prepare/catalog/crawl 三步。详细说明见：
 

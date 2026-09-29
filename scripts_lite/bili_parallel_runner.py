@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""Launch 2-4 isolated Bilibili crawler worker processes."""
+"""Launch isolated Bilibili crawler worker processes."""
 
 from __future__ import annotations
 
@@ -17,6 +17,11 @@ from typing import IO, List, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PIPELINE = PROJECT_ROOT / "scripts_lite" / "bili_creator_pipeline.py"
+
+
+def validate_worker_count(worker_count: int) -> None:
+    if worker_count < 2:
+        raise ValueError("workers must be at least 2")
 
 
 def build_worker_command(args: argparse.Namespace, worker_index: int) -> List[str]:
@@ -70,8 +75,13 @@ def terminate_workers(workers: List[Tuple[int, subprocess.Popen[bytes], IO[bytes
 def run(args: argparse.Namespace) -> int:
     args.output_root = args.output_root.expanduser().resolve()
     args.cookie_file = args.cookie_file.expanduser().resolve()
-    if args.workers < 2 or args.workers > 4:
-        raise ValueError("workers must be between 2 and 4")
+    validate_worker_count(args.workers)
+    if args.workers > 4:
+        print(
+            f"Warning: starting {args.workers} workers increases resource use and "
+            "Bilibili rate-limit risk.",
+            flush=True,
+        )
     if args.min_sleep < 0 or args.max_sleep < args.min_sleep:
         raise ValueError("sleep range is invalid")
     if not args.cookie_file.is_file():
@@ -156,7 +166,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run isolated Bilibili crawler processes in parallel.")
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--cookie-file", type=Path, required=True)
-    parser.add_argument("--workers", type=int, default=3, help="2-4 workers; default: 3")
+    parser.add_argument("--workers", type=int, default=3, help="at least 2; default: 3")
     parser.add_argument("--batch-index", type=int, default=0, help="0 means all batches")
     parser.add_argument("--min-sleep", type=float, default=3.0)
     parser.add_argument("--max-sleep", type=float, default=6.0)
