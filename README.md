@@ -83,6 +83,24 @@ uv run python scripts_lite/bili_export_video_metadata.py \
 
 默认生成 `<dataset-root>/exports/video_metadata.csv` 和 `video_metadata.jsonl`。`original_description` 是 B 站原简介，空白的 `generated_description` 可用于后续生成结果。添加 `--completed-only` 可仅导出评论、子评论和弹幕均已完成的视频。
 
+### 并发生成视频 description
+
+下面的脚本读取上述导出文件，下载完整音轨，上传到百炼做 ASR，再由 Qwen 根据标题、原简介和转写生成 description。Cookie 只用于 B 站下载，不会发给百炼。每条结果独立保存，重启时自动跳过已完成项：
+
+```bash
+export DASHSCOPE_API_KEY='你的百炼 API Key'
+python scripts_lite/bili_generate_descriptions.py \
+  --input /path/to/creator_video_catalog_server_ready/exports/video_metadata.jsonl \
+  --output-dir /path/to/creator_video_catalog_server_ready/descriptions \
+  --cookie-file /path/to/bilibili.cookie \
+  --workers 12 \
+  --download-workers 3
+```
+
+`--workers` 控制 ASR/LLM 总并发，`--download-workers` 单独限制同时访问 B 站下载音频的数量。默认 ASR 成功后删除音频以节省磁盘；加 `--keep-audio` 可保留。汇总结果为 `results.jsonl` 和 `results.csv`，失败项写入 `failures.jsonl`。对 ASR 失败但已用标题/简介生成的 `partial` 结果，可用 `--retry-partial` 重试。
+
+正式批量处理前建议添加 `--limit 10` 验证 API 额度、下载速度和输出质量。完整 ASR 转写保存在每个视频的 `items/<video_id>/asr.json` 中，汇总文件只保存 description 和状态字段，避免重复存储大段转写。
+
 可用 `all` 代替 prepare/catalog/crawl 三步。详细说明见：
 
 - [数据结构与参数](docs/bili_creator_pipeline.md)
