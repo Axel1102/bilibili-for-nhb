@@ -72,6 +72,17 @@ uv run python scripts_lite/bili_parallel_runner.py \
 
 日志保存在 `<output-root>/state/parallel_logs/worker_*.log`。`--workers` 没有硬性上限，但进程越多，服务器内存和 CPU 占用越高，也越容易触发平台风控；建议逐步从 3 个增加。并行模式默认把每个 worker 的请求间隔调整为 3–6 秒。
 
+### 导出视频 URL、标题和简介
+
+导出所有已获取到 `detail.json` 的视频；评论或弹幕还未完成的视频也会导出，并通过 `fully_completed` 字段标记：
+
+```bash
+uv run python scripts_lite/bili_export_video_metadata.py \
+  --dataset-root /path/to/creator_video_catalog_server_ready
+```
+
+默认生成 `<dataset-root>/exports/video_metadata.csv` 和 `video_metadata.jsonl`。`original_description` 是 B 站原简介，空白的 `generated_description` 可用于后续生成结果。添加 `--completed-only` 可仅导出评论、子评论和弹幕均已完成的视频。
+
 可用 `all` 代替 prepare/catalog/crawl 三步。详细说明见：
 
 - [数据结构与参数](docs/bili_creator_pipeline.md)
