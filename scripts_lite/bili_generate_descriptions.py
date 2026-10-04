@@ -23,10 +23,14 @@ import httpx
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROMPT = PROJECT_ROOT / "prompts" / "bilibili_description_prompt_zh.txt"
+DEFAULT_VIDEO_PROMPT = (
+    PROJECT_ROOT / "prompts" / "bilibili_video_understanding_prompt_zh.txt"
+)
 DEFAULT_OPENAI_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_API_BASE_URL = "https://dashscope.aliyuncs.com/api/v1"
 DEFAULT_TEXT_MODEL = "qwen3.8-flash"
 DEFAULT_ASR_MODEL = "qwen-audio-3.1-asr-flash-filetrans"
+DEFAULT_VIDEO_MODEL = "qwen3.8-omni-flash"
 CHROME_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
@@ -40,12 +44,19 @@ CSV_FIELDS = [
     "title",
     "original_description",
     "generated_description",
+    "description_source",
+    "text_description",
     "status",
     "needs_video_understanding",
     "insufficient_information_reason",
+    "video_understanding_requested",
+    "video_understanding_completed",
+    "video_understanding_trigger_reason",
+    "video_understanding_error",
     "asr_error",
     "text_model",
     "asr_model",
+    "video_model",
     "total_tokens",
     "completed_at",
 ]
@@ -275,6 +286,121 @@ def download_audio(
         return audio, time.perf_counter() - started, False
 
 
+def _find_video(item_dir: Path, video_id: str) -> Path | None:
+    allowed = {".mp4", ".mkv", ".mov", ".webm"}
+    candidates = [
+        path
+        for path in item_dir.glob(f"{_safe_id(video_id)}.video.*")
+        if path.is_file() and path.suffix.lower() in allowed
+    ]
+    return sorted(candidates)[0] if candidates else None
+
+
+def build_video_command(
+    video: Dict[str, Any],
+    item_dir: Path,
+    cookie_jar: Path | None,
+    ffmpeg_path: str,
+    max_height: int,
+) -> List[str]:
+    format_selector = (
+        f"bv*[ext=mp4][height<={max_height}]+ba[ext=m4a]/"
+        f"bv*[ext=mp4][width<={max_height}]+ba[ext=m4a]/"
+        f"b[ext=mp4][height<={max_height}]/"
+        "bv*[ext=mp4]+ba[ext=m4a]/b"
+    )
+    command = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--no-playlist",
+        "--retries",
+        "10",
+        "--fragment-retries",
+        "10",
+        "--retry-sleep",
+        "2",
+        "--force-ipv4",
+        "--user-agent",
+        CHROME_USER_AGENT,
+        "--add-header",
+        "Origin:https://www.bilibili.com",
+        "--add-header",
+        f"Referer:{video['video_url']}",
+        "--format",
+        format_selector,
+        "--merge-output-format",
+        "mp4",
+        "--ffmpeg-location",
+        ffmpeg_path,
+        "--no-overwrites",
+        "--output",
+        str(item_dir / f"{_safe_id(str(video['video_id']))}.video.%(ext)s"),
+        "--print",
+        "after_move:filepath",
+    ]
+    if cookie_jar:
+        command.extend(["--cookies", str(cookie_jar)])
+    command.append(str(video["video_url"]))
+    return command
+
+
+def download_video(
+    video: Dict[str, Any],
+    item_dir: Path,
+    cookie_jar: Path | None,
+    download_gate: threading.BoundedSemaphore,
+    max_height: int,
+) -> Tuple[Path, float, bool]:
+    video_id = str(video["video_id"])
+    cached = _find_video(item_dir, video_id)
+    if cached:
+        return cached, 0.0, True
+    with download_gate:
+        cached = _find_video(item_dir, video_id)
+        if cached:
+            return cached, 0.0, True
+        for pattern in (
+            f"{_safe_id(video_id)}.video*.part",
+            f"{_safe_id(video_id)}.video*.ytdl",
+        ):
+            for temporary in item_dir.glob(pattern):
+                temporary.unlink(missing_ok=True)
+        try:
+            import imageio_ffmpeg
+
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        except ImportError as exc:
+            raise RuntimeError(
+                "Missing imageio-ffmpeg; install requirements.txt"
+            ) from exc
+        started = time.perf_counter()
+        process = subprocess.run(
+            build_video_command(
+                video,
+                item_dir,
+                cookie_jar,
+                ffmpeg_path,
+                max_height,
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if process.returncode != 0:
+            details = "\n".join(
+                part.strip()
+                for part in (process.stdout, process.stderr)
+                if part.strip()
+            )
+            last_line = details.splitlines()[-1] if details else "unknown error"
+            raise RuntimeError(f"yt-dlp video download failed: {last_line}")
+        downloaded = _find_video(item_dir, video_id)
+        if not downloaded:
+            raise RuntimeError("yt-dlp succeeded but no video file was found")
+        return downloaded, time.perf_counter() - started, False
+
+
 def _object_to_dict(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -300,7 +426,7 @@ def _upload_file(
     path: Path,
 ) -> str:
     if path.stat().st_size > 1024**3:
-        raise ValueError(f"Audio exceeds the 1GB upload limit: {path}")
+        raise ValueError(f"File exceeds the 1GB upload limit: {path}")
     response = http.get(
         f"{api_base_url.rstrip('/')}/uploads",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -538,20 +664,187 @@ def generate_description(
     raise ValueError(f"model returned invalid JSON twice: {last_error}")
 
 
+def call_video_model(
+    api_key: str,
+    base_url: str,
+    model: str,
+    prompt: str,
+    oss_url: str,
+    fps: float,
+) -> Tuple[str, Dict[str, Any], str]:
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=1800.0)
+    video_item: Dict[str, Any] = {
+        "type": "video_url",
+        "video_url": {"url": oss_url},
+    }
+    if model.startswith("MiniMax/") and fps > 0:
+        video_item["fps"] = fps
+    request: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    video_item,
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
+        "max_tokens": 600,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "extra_headers": {"X-DashScope-OssResourceResolve": "enable"},
+    }
+    if model.startswith("qwen3.8-"):
+        request["reasoning_effort"] = "none"
+        request["modalities"] = ["text"]
+    parts: List[str] = []
+    usage: Dict[str, Any] = {}
+    request_id = ""
+    for chunk in client.chat.completions.create(**request):
+        request_id = request_id or str(getattr(chunk, "id", "") or "")
+        if getattr(chunk, "usage", None):
+            usage = _object_to_dict(chunk.usage)
+        if not getattr(chunk, "choices", None):
+            continue
+        content = getattr(chunk.choices[0].delta, "content", None)
+        if isinstance(content, str):
+            parts.append(content)
+    description = "".join(parts).strip()
+    if not description:
+        raise ValueError("video model returned an empty description")
+    return description, usage, request_id
+
+
+def run_video_understanding(
+    base_result: Dict[str, Any],
+    video: Dict[str, Any],
+    item_dir: Path,
+    result_path: Path,
+    args: argparse.Namespace,
+    video_prompt: str,
+    api_key: str,
+) -> Dict[str, Any]:
+    stage_path = item_dir / "video_understanding.json"
+    cached_stage = _read_json(stage_path) if not args.overwrite else {}
+    if cached_stage.get("description"):
+        stage_result = cached_stage
+    else:
+        video_path: Path | None = None
+        try:
+            with args.video_gate:
+                video_path, download_seconds, video_cached = download_video(
+                    video,
+                    item_dir,
+                    args.cookie_jar,
+                    args.download_gate,
+                    args.max_video_height,
+                )
+                with httpx.Client(
+                    timeout=httpx.Timeout(1800.0, connect=30.0),
+                    follow_redirects=True,
+                ) as http:
+                    upload_started = time.perf_counter()
+                    oss_url = _upload_file(
+                        http,
+                        api_key,
+                        args.api_base_url,
+                        args.video_model,
+                        video_path,
+                    )
+                    upload_seconds = time.perf_counter() - upload_started
+                inference_started = time.perf_counter()
+                description, usage, request_id = call_video_model(
+                    api_key,
+                    args.openai_base_url,
+                    args.video_model,
+                    video_prompt,
+                    oss_url,
+                    args.video_fps,
+                )
+                inference_seconds = time.perf_counter() - inference_started
+            stage_result = {
+                "model": args.video_model,
+                "description": description,
+                "usage": usage,
+                "request_id": request_id,
+                "download_seconds": round(download_seconds, 3),
+                "download_cached": video_cached,
+                "upload_seconds": round(upload_seconds, 3),
+                "inference_seconds": round(inference_seconds, 3),
+                "completed_at": int(time.time()),
+            }
+            _atomic_write_json(stage_path, stage_result)
+        finally:
+            if (
+                video_path
+                and not args.keep_video
+                and stage_path.exists()
+            ):
+                video_path.unlink(missing_ok=True)
+
+    final = dict(base_result)
+    final["status"] = "ok"
+    final["text_description"] = str(
+        final.get("text_description")
+        or final.get("generated_description")
+        or ""
+    )
+    final["generated_description"] = str(stage_result["description"])
+    final["description_source"] = "video"
+    final["needs_video_understanding"] = False
+    final["insufficient_information_reason"] = ""
+    final["video_understanding_completed"] = True
+    final["video_understanding"] = {**stage_result, "error": ""}
+    final["total_tokens"] = int(final.get("total_tokens") or 0) + _token_counts(
+        _object_to_dict(stage_result.get("usage"))
+    )[2]
+    final["completed_at"] = int(time.time())
+    _atomic_write_json(result_path, final)
+    return final
+
+
 def process_video(
     video: Dict[str, Any],
     args: argparse.Namespace,
     prompt: str,
+    video_prompt: str,
     api_key: str,
 ) -> Dict[str, Any]:
     video_id = str(video["video_id"])
     item_dir = args.output_dir / "items" / _safe_id(video_id)
     result_path = item_dir / "result.json"
     existing = _read_json(result_path)
-    if existing and not args.overwrite and not (
-        args.retry_partial and existing.get("status") == "partial"
-    ):
-        return existing
+    if existing and not args.overwrite:
+        existing_asr = existing.get("asr") or {}
+        needs_video_stage = (
+            bool(existing.get("needs_video_understanding"))
+            or bool(existing_asr.get("error"))
+            or not str(existing_asr.get("transcript") or "").strip()
+        ) and not bool(existing.get("video_understanding_completed"))
+        if needs_video_stage:
+            existing["needs_video_understanding"] = True
+            existing["video_understanding_requested"] = True
+            existing.setdefault(
+                "video_understanding_trigger_reason",
+                str(existing.get("insufficient_information_reason") or "")
+                or str(existing_asr.get("error") or "")
+                or "ASR 没有可用转写。",
+            )
+            _atomic_write_json(result_path, existing)
+            return run_video_understanding(
+                existing,
+                video,
+                item_dir,
+                result_path,
+                args,
+                video_prompt,
+                api_key,
+            )
+        if not (args.retry_partial and existing.get("status") == "partial"):
+            return existing
 
     started = time.perf_counter()
     audio: Path | None = None
@@ -607,8 +900,18 @@ def process_video(
         transcript,
         asr_error,
     )
+    needs_video = bool(
+        model_result["needs_video_understanding"]
+        or asr_error
+        or not transcript.strip()
+    )
+    trigger_reason = str(
+        model_result["insufficient_information_reason"]
+        or asr_error
+        or ("ASR 没有可用转写。" if not transcript.strip() else "")
+    )
     result = {
-        "status": "partial" if asr_error else "ok",
+        "status": "partial" if asr_error or needs_video else "ok",
         "video_id": video_id,
         "bvid": str(video.get("bvid") or ""),
         "creator_id": str(video.get("creator_id") or ""),
@@ -617,12 +920,13 @@ def process_video(
         "title": str(video.get("title") or ""),
         "original_description": str(video.get("description") or ""),
         "generated_description": model_result["description"],
-        "needs_video_understanding": model_result[
-            "needs_video_understanding"
-        ],
-        "insufficient_information_reason": model_result[
-            "insufficient_information_reason"
-        ],
+        "text_description": model_result["description"],
+        "description_source": "text",
+        "needs_video_understanding": needs_video,
+        "insufficient_information_reason": trigger_reason,
+        "video_understanding_requested": needs_video,
+        "video_understanding_completed": False,
+        "video_understanding_trigger_reason": trigger_reason,
         "asr": {
             "model": args.asr_model,
             "transcript": transcript,
@@ -645,17 +949,66 @@ def process_video(
         "completed_at": int(time.time()),
     }
     _atomic_write_json(result_path, result)
+    if needs_video:
+        try:
+            return run_video_understanding(
+                result,
+                video,
+                item_dir,
+                result_path,
+                args,
+                video_prompt,
+                api_key,
+            )
+        except Exception as exc:
+            result["status"] = "partial"
+            result["video_understanding"] = {
+                "model": args.video_model,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            _atomic_write_json(result_path, result)
+            raise
     return result
 
 
 def _csv_row(result: Dict[str, Any]) -> Dict[str, Any]:
+    asr = result.get("asr") or {}
+    text_model = result.get("description_model") or {}
+    video_stage = result.get("video_understanding") or {}
     return {
-        **result,
-        "asr_error": str((result.get("asr") or {}).get("error") or ""),
-        "text_model": str(
-            (result.get("description_model") or {}).get("model") or ""
+        "video_id": str(result.get("video_id") or ""),
+        "bvid": str(result.get("bvid") or ""),
+        "creator_id": str(result.get("creator_id") or ""),
+        "creator_name": str(result.get("creator_name") or ""),
+        "video_url": str(result.get("video_url") or ""),
+        "title": str(result.get("title") or ""),
+        "original_description": str(result.get("original_description") or ""),
+        "generated_description": str(result.get("generated_description") or ""),
+        "description_source": str(result.get("description_source") or "text"),
+        "text_description": str(result.get("text_description") or ""),
+        "status": str(result.get("status") or ""),
+        "needs_video_understanding": bool(
+            result.get("needs_video_understanding")
         ),
-        "asr_model": str((result.get("asr") or {}).get("model") or ""),
+        "insufficient_information_reason": str(
+            result.get("insufficient_information_reason") or ""
+        ),
+        "video_understanding_requested": bool(
+            result.get("video_understanding_requested")
+        ),
+        "video_understanding_completed": bool(
+            result.get("video_understanding_completed")
+        ),
+        "video_understanding_trigger_reason": str(
+            result.get("video_understanding_trigger_reason") or ""
+        ),
+        "video_understanding_error": str(video_stage.get("error") or ""),
+        "asr_error": str(asr.get("error") or ""),
+        "text_model": str(text_model.get("model") or ""),
+        "asr_model": str(asr.get("model") or ""),
+        "video_model": str(video_stage.get("model") or ""),
+        "total_tokens": int(result.get("total_tokens") or 0),
+        "completed_at": int(result.get("completed_at") or 0),
     }
 
 
@@ -711,7 +1064,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--text-model", default=DEFAULT_TEXT_MODEL)
     parser.add_argument("--asr-model", default=DEFAULT_ASR_MODEL)
+    parser.add_argument("--video-model", default=DEFAULT_VIDEO_MODEL)
     parser.add_argument("--prompt", type=Path, default=DEFAULT_PROMPT)
+    parser.add_argument(
+        "--video-prompt", type=Path, default=DEFAULT_VIDEO_PROMPT
+    )
+    parser.add_argument(
+        "--video-workers",
+        type=int,
+        default=2,
+        help="simultaneous video-understanding stages; default: 2",
+    )
+    parser.add_argument("--max-video-height", type=int, default=360)
+    parser.add_argument("--video-fps", type=float, default=1.0)
     parser.add_argument(
         "--openai-base-url",
         default=os.getenv("DASHSCOPE_BASE_URL", DEFAULT_OPENAI_BASE_URL),
@@ -724,6 +1089,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--asr-timeout-seconds", type=float, default=1800.0)
     parser.add_argument("--limit", type=int, default=0, help="0 means all rows")
     parser.add_argument("--keep-audio", action="store_true")
+    parser.add_argument("--keep-video", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--retry-partial", action="store_true")
     return parser
@@ -731,10 +1097,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    if args.workers <= 0 or args.download_workers <= 0:
-        raise ValueError("workers and download-workers must be greater than zero")
+    if args.workers <= 0 or args.download_workers <= 0 or args.video_workers <= 0:
+        raise ValueError(
+            "workers, download-workers, and video-workers must be greater than zero"
+        )
     if args.download_workers > args.workers:
         raise ValueError("download-workers cannot exceed workers")
+    if args.video_workers > args.workers:
+        raise ValueError("video-workers cannot exceed workers")
+    if args.max_video_height <= 0 or args.video_fps <= 0:
+        raise ValueError("max-video-height and video-fps must be greater than zero")
     api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("DASHSCOPE_API_KEY is missing")
@@ -743,8 +1115,11 @@ def main() -> int:
     args.output_dir = args.output_dir.expanduser().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     prompt = args.prompt.expanduser().read_text(encoding="utf-8").strip()
+    video_prompt = args.video_prompt.expanduser().read_text(encoding="utf-8").strip()
     if not prompt or "JSON" not in prompt:
         raise ValueError("prompt is empty or does not request JSON")
+    if not video_prompt:
+        raise ValueError("video prompt is empty")
     videos = load_input(args.input)
     if args.limit > 0:
         videos = videos[: args.limit]
@@ -752,6 +1127,7 @@ def main() -> int:
         args.cookie_file, args.output_dir / "state"
     )
     args.download_gate = threading.BoundedSemaphore(args.download_workers)
+    args.video_gate = threading.BoundedSemaphore(args.video_workers)
 
     saved = _load_saved_results(args.output_dir)
     pending = [
@@ -760,6 +1136,19 @@ def main() -> int:
         if args.overwrite
         or str(video["video_id"]) not in saved
         or (
+            (
+                bool(saved[str(video["video_id"])].get("needs_video_understanding"))
+                or bool((saved[str(video["video_id"])].get("asr") or {}).get("error"))
+                or not str(
+                    (saved[str(video["video_id"])].get("asr") or {}).get("transcript")
+                    or ""
+                ).strip()
+            )
+            and not bool(
+                saved[str(video["video_id"])].get("video_understanding_completed")
+            )
+        )
+        or (
             args.retry_partial
             and saved[str(video["video_id"])].get("status") == "partial"
         )
@@ -767,7 +1156,8 @@ def main() -> int:
     print(
         f"input={len(videos)}, existing={len(videos) - len(pending)}, "
         f"pending={len(pending)}, workers={args.workers}, "
-        f"download_workers={args.download_workers}",
+        f"download_workers={args.download_workers}, "
+        f"video_workers={args.video_workers}",
         flush=True,
     )
 
@@ -783,7 +1173,12 @@ def main() -> int:
                 chunk = pending[start : start + queue_size]
                 futures: Dict[Future[Dict[str, Any]], Dict[str, Any]] = {
                     executor.submit(
-                        process_video, video, args, prompt, api_key
+                        process_video,
+                        video,
+                        args,
+                        prompt,
+                        video_prompt,
+                        api_key,
                     ): video
                     for video in chunk
                 }
@@ -801,6 +1196,14 @@ def main() -> int:
                         )
                     except Exception as exc:
                         failed += 1
+                        partial_result = _read_json(
+                            args.output_dir
+                            / "items"
+                            / _safe_id(video_id)
+                            / "result.json"
+                        )
+                        if partial_result:
+                            saved[video_id] = partial_result
                         failure = {
                             "video_id": video_id,
                             "video_url": video.get("video_url", ""),

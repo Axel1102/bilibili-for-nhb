@@ -85,7 +85,7 @@ uv run python scripts_lite/bili_export_video_metadata.py \
 
 ### 并发生成视频 description
 
-下面的脚本读取上述导出文件，下载完整音轨，上传到百炼做 ASR，再由 Qwen 根据标题、原简介和转写生成 description。Cookie 只用于 B 站下载，不会发给百炼。每条结果独立保存，重启时自动跳过已完成项：
+下面的脚本读取上述导出文件，下载完整音轨，上传到百炼做 ASR，再由 Qwen 根据标题、原简介和转写生成 description。如果 ASR 失败、没有有效转写，或文本模型判断必须查看画面，脚本会自动下载低清视频并调用视频理解模型生成最终 description。Cookie 只用于 B 站下载，不会发给百炼；音频和需要理解的视频会上传到百炼。每条结果独立保存，重启时从已完成阶段继续：
 
 ```bash
 export DASHSCOPE_API_KEY='你的百炼 API Key'
@@ -94,10 +94,13 @@ python scripts_lite/bili_generate_descriptions.py \
   --output-dir /path/to/creator_video_catalog_server_ready/descriptions \
   --cookie-file /path/to/bilibili.cookie \
   --workers 12 \
-  --download-workers 3
+  --download-workers 3 \
+  --video-workers 2
 ```
 
-`--workers` 控制 ASR/LLM 总并发，`--download-workers` 单独限制同时访问 B 站下载音频的数量。默认 ASR 成功后删除音频以节省磁盘；加 `--keep-audio` 可保留。汇总结果为 `results.jsonl` 和 `results.csv`，失败项写入 `failures.jsonl`。对 ASR 失败但已用标题/简介生成的 `partial` 结果，可用 `--retry-partial` 重试。
+`--workers` 控制总线程数，`--download-workers` 限制同时访问 B 站的音频和视频下载数，`--video-workers` 限制同时进行的视频上传与视频模型调用数。视频理解默认使用 `qwen3.8-omni-flash`，下载视频的最高分辨率为 360p，可通过 `--video-model` 和 `--max-video-height` 调整；`--video-fps` 用于支持显式 FPS 参数的模型。默认成功后删除本地音频和低清视频；加 `--keep-audio` 或 `--keep-video` 可保留。
+
+汇总结果为 `results.jsonl` 和 `results.csv`。`description_source` 表示最终描述来自 `text` 还是 `video`；`text_description` 保留视频理解前的文本阶段描述。失败项写入 `failures.jsonl`，重新运行会自动继续未完成的视频理解阶段。对其他 `partial` 结果可用 `--retry-partial` 重试。
 
 正式批量处理前建议添加 `--limit 10` 验证 API 额度、下载速度和输出质量。完整 ASR 转写保存在每个视频的 `items/<video_id>/asr.json` 中，汇总文件只保存 description 和状态字段，避免重复存储大段转写。
 

@@ -4,6 +4,7 @@ import csv
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -92,6 +93,23 @@ def test_audio_command_uses_cookie_jar_and_full_audio(tmp_path: Path) -> None:
     assert "--cookies" in command
 
 
+def test_video_command_limits_resolution(tmp_path: Path) -> None:
+    command = generator.build_video_command(
+        {
+            "video_id": "BV1",
+            "video_url": "https://www.bilibili.com/video/BV1",
+        },
+        tmp_path,
+        tmp_path / "cookies.txt",
+        "/tmp/ffmpeg",
+        360,
+    )
+    selector = command[command.index("--format") + 1]
+    assert "height<=360" in selector
+    assert "--merge-output-format" in command
+    assert "--cookies" in command
+
+
 def test_validate_model_result_requires_reason() -> None:
     with pytest.raises(ValueError, match="reason"):
         generator.validate_model_result(
@@ -118,3 +136,75 @@ def test_write_aggregate_has_generated_description(tmp_path: Path) -> None:
         encoding="utf-8-sig", newline=""
     ) as handle:
         assert list(csv.DictReader(handle))[0]["generated_description"] == "生成内容"
+
+
+def test_summary_does_not_duplicate_asr_transcript(tmp_path: Path) -> None:
+    result = {
+        "video_id": "BV1",
+        "generated_description": "生成内容",
+        "status": "ok",
+        "asr": {"model": "asr", "transcript": "很长的转写"},
+    }
+    generator.write_aggregate(tmp_path, {"BV1": result})
+    assert "很长的转写" not in (tmp_path / "results.jsonl").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_asr_failure_forces_video_understanding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        generator,
+        "download_audio",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("ASR source failed")),
+    )
+    monkeypatch.setattr(
+        generator,
+        "generate_description",
+        lambda *args, **kwargs: (
+            {
+                "description": "仅根据标题形成的临时描述",
+                "needs_video_understanding": False,
+                "insufficient_information_reason": "",
+            },
+            {},
+            [],
+        ),
+    )
+    called = []
+
+    def fake_video_stage(base_result, *args, **kwargs):
+        called.append(base_result)
+        return {**base_result, "video_understanding_completed": True}
+
+    monkeypatch.setattr(generator, "run_video_understanding", fake_video_stage)
+    args = SimpleNamespace(
+        output_dir=tmp_path,
+        overwrite=False,
+        retry_partial=False,
+        cookie_jar=None,
+        download_gate=None,
+        keep_audio=False,
+        openai_base_url="https://example.invalid",
+        text_model="text",
+        api_base_url="https://example.invalid",
+        asr_model="asr",
+        poll_seconds=1,
+        asr_timeout_seconds=1,
+    )
+    result = generator.process_video(
+        {
+            "video_id": "BV1",
+            "video_url": "https://www.bilibili.com/video/BV1",
+            "title": "标题",
+            "description": "",
+        },
+        args,
+        "text prompt",
+        "video prompt",
+        "api-key",
+    )
+    assert called
+    assert called[0]["needs_video_understanding"] is True
+    assert result["video_understanding_completed"] is True
