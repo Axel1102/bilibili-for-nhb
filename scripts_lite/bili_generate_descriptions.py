@@ -60,6 +60,19 @@ CSV_FIELDS = [
     "total_tokens",
     "completed_at",
 ]
+VIDEO_QUEUE_FIELDS = [
+    "video_id",
+    "bvid",
+    "creator_id",
+    "creator_name",
+    "video_url",
+    "title",
+    "original_description",
+    "text_description",
+    "video_understanding_trigger_reason",
+    "asr_error",
+    "completed_at",
+]
 
 
 def _atomic_write_json(path: Path, value: Dict[str, Any]) -> None:
@@ -74,7 +87,11 @@ def _atomic_write_json(path: Path, value: Dict[str, Any]) -> None:
 
 
 def _atomic_write_rows(
-    path: Path, rows: Iterable[Dict[str, Any]], *, jsonl: bool
+    path: Path,
+    rows: Iterable[Dict[str, Any]],
+    *,
+    jsonl: bool,
+    fieldnames: List[str] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -85,7 +102,9 @@ def _atomic_write_rows(
     else:
         with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(
-                handle, fieldnames=CSV_FIELDS, extrasaction="ignore"
+                handle,
+                fieldnames=fieldnames or CSV_FIELDS,
+                extrasaction="ignore",
             )
             writer.writeheader()
             writer.writerows(rows)
@@ -141,6 +160,23 @@ def load_input(path: Path) -> List[Dict[str, Any]]:
 
 def _safe_id(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._") or "unknown"
+
+
+def _worker_log(args: argparse.Namespace, video_id: str, message: str) -> None:
+    thread_name = threading.current_thread().name
+    match = re.search(r"_(\d+)$", thread_name)
+    worker_number = int(match.group(1)) + 1 if match else 0
+    filename = (
+        f"worker_{worker_number:02d}.log"
+        if worker_number
+        else f"worker_{_safe_id(thread_name)}.log"
+    )
+    logs_dir = getattr(args, "worker_logs_dir", args.output_dir / "worker_logs")
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    path = logs_dir / filename
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{timestamp} [{video_id}] {message}\n")
 
 
 def prepare_cookie_jar(
@@ -727,10 +763,13 @@ def run_video_understanding(
     video_prompt: str,
     api_key: str,
 ) -> Dict[str, Any]:
+    video_id = str(video["video_id"])
+    _worker_log(args, video_id, "video understanding: start")
     stage_path = item_dir / "video_understanding.json"
     cached_stage = _read_json(stage_path) if not args.overwrite else {}
     if cached_stage.get("description"):
         stage_result = cached_stage
+        _worker_log(args, video_id, "video understanding: reuse cached result")
     else:
         video_path: Path | None = None
         try:
@@ -741,6 +780,11 @@ def run_video_understanding(
                     args.cookie_jar,
                     args.download_gate,
                     args.max_video_height,
+                )
+                _worker_log(
+                    args,
+                    video_id,
+                    f"video download: done cached={video_cached} seconds={download_seconds:.1f}",
                 )
                 with httpx.Client(
                     timeout=httpx.Timeout(1800.0, connect=30.0),
@@ -765,6 +809,11 @@ def run_video_understanding(
                     args.video_fps,
                 )
                 inference_seconds = time.perf_counter() - inference_started
+                _worker_log(
+                    args,
+                    video_id,
+                    f"video model: done seconds={inference_seconds:.1f}",
+                )
             stage_result = {
                 "model": args.video_model,
                 "description": description,
@@ -803,6 +852,7 @@ def run_video_understanding(
     )[2]
     final["completed_at"] = int(time.time())
     _atomic_write_json(result_path, final)
+    _worker_log(args, video_id, "video understanding: completed")
     return final
 
 
@@ -834,16 +884,20 @@ def process_video(
                 or "ASR 没有可用转写。",
             )
             _atomic_write_json(result_path, existing)
-            return run_video_understanding(
-                existing,
-                video,
-                item_dir,
-                result_path,
-                args,
-                video_prompt,
-                api_key,
-            )
+            if args.video_mode == "auto":
+                return run_video_understanding(
+                    existing,
+                    video,
+                    item_dir,
+                    result_path,
+                    args,
+                    video_prompt,
+                    api_key,
+                )
+            _worker_log(args, video_id, "video understanding: queued")
+            return existing
         if not (args.retry_partial and existing.get("status") == "partial"):
+            _worker_log(args, video_id, "resume: reuse completed result")
             return existing
 
     started = time.perf_counter()
@@ -856,18 +910,26 @@ def process_video(
     asr_error = ""
     asr_path = item_dir / "asr.json"
     try:
+        _worker_log(args, video_id, "audio download: start")
         audio, download_seconds, audio_cached = download_audio(
             video,
             item_dir,
             args.cookie_jar,
             args.download_gate,
         )
+        _worker_log(
+            args,
+            video_id,
+            f"audio download: done cached={audio_cached} seconds={download_seconds:.1f}",
+        )
         cached_asr = _read_json(asr_path) if not args.overwrite else {}
         if cached_asr:
             transcript = str(cached_asr.get("transcript") or "")
             asr_usage = _object_to_dict(cached_asr.get("usage"))
             asr_task_id = str(cached_asr.get("task_id") or "")
+            _worker_log(args, video_id, "ASR: reuse cached result")
         else:
+            _worker_log(args, video_id, "ASR: start")
             transcript, asr_usage, asr_task_id = transcribe_audio(
                 audio,
                 api_key,
@@ -885,12 +947,19 @@ def process_video(
                     "usage": asr_usage,
                 },
             )
+            _worker_log(
+                args,
+                video_id,
+                f"ASR: done transcript_chars={len(transcript)}",
+            )
     except Exception as exc:
         asr_error = f"{type(exc).__name__}: {exc}"
+        _worker_log(args, video_id, f"ASR path: partial error={asr_error}")
     finally:
         if audio and not args.keep_audio and (transcript or asr_path.exists()):
             audio.unlink(missing_ok=True)
 
+    _worker_log(args, video_id, "text model: start")
     model_result, text_usage, request_ids = generate_description(
         api_key,
         args.openai_base_url,
@@ -949,7 +1018,15 @@ def process_video(
         "completed_at": int(time.time()),
     }
     _atomic_write_json(result_path, result)
+    _worker_log(
+        args,
+        video_id,
+        f"text model: done needs_video_understanding={needs_video}",
+    )
     if needs_video:
+        if args.video_mode == "queue":
+            _worker_log(args, video_id, "video understanding: queued")
+            return result
         try:
             return run_video_understanding(
                 result,
@@ -968,6 +1045,34 @@ def process_video(
             }
             _atomic_write_json(result_path, result)
             raise
+    return result
+
+
+def process_video_logged(
+    video: Dict[str, Any],
+    args: argparse.Namespace,
+    prompt: str,
+    video_prompt: str,
+    api_key: str,
+) -> Dict[str, Any]:
+    video_id = str(video["video_id"])
+    _worker_log(args, video_id, "task: start")
+    try:
+        result = process_video(
+            video,
+            args,
+            prompt,
+            video_prompt,
+            api_key,
+        )
+    except Exception as exc:
+        _worker_log(args, video_id, f"task: failed {type(exc).__name__}: {exc}")
+        raise
+    _worker_log(
+        args,
+        video_id,
+        f"task: finished status={result.get('status')}",
+    )
     return result
 
 
@@ -1037,6 +1142,26 @@ def write_aggregate(
         ordered,
         jsonl=False,
     )
+    video_queue = [
+        {
+            key: row.get(key, "")
+            for key in VIDEO_QUEUE_FIELDS
+        }
+        for row in ordered
+        if bool(row.get("needs_video_understanding"))
+        and not bool(row.get("video_understanding_completed"))
+    ]
+    _atomic_write_rows(
+        output_dir / "video_understanding_queue.jsonl",
+        video_queue,
+        jsonl=True,
+    )
+    _atomic_write_rows(
+        output_dir / "video_understanding_queue.csv",
+        video_queue,
+        jsonl=False,
+        fieldnames=VIDEO_QUEUE_FIELDS,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1065,6 +1190,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-model", default=DEFAULT_TEXT_MODEL)
     parser.add_argument("--asr-model", default=DEFAULT_ASR_MODEL)
     parser.add_argument("--video-model", default=DEFAULT_VIDEO_MODEL)
+    parser.add_argument(
+        "--video-mode",
+        choices=["queue", "auto"],
+        default="queue",
+        help="queue only marks video-understanding work; auto executes it (default: queue)",
+    )
     parser.add_argument("--prompt", type=Path, default=DEFAULT_PROMPT)
     parser.add_argument(
         "--video-prompt", type=Path, default=DEFAULT_VIDEO_PROMPT
@@ -1114,6 +1245,8 @@ def main() -> int:
     args.input = args.input.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.worker_logs_dir = args.output_dir / "worker_logs"
+    args.worker_logs_dir.mkdir(parents=True, exist_ok=True)
     prompt = args.prompt.expanduser().read_text(encoding="utf-8").strip()
     video_prompt = args.video_prompt.expanduser().read_text(encoding="utf-8").strip()
     if not prompt or "JSON" not in prompt:
@@ -1136,7 +1269,8 @@ def main() -> int:
         if args.overwrite
         or str(video["video_id"]) not in saved
         or (
-            (
+            args.video_mode == "auto"
+            and (
                 bool(saved[str(video["video_id"])].get("needs_video_understanding"))
                 or bool((saved[str(video["video_id"])].get("asr") or {}).get("error"))
                 or not str(
@@ -1157,9 +1291,10 @@ def main() -> int:
         f"input={len(videos)}, existing={len(videos) - len(pending)}, "
         f"pending={len(pending)}, workers={args.workers}, "
         f"download_workers={args.download_workers}, "
-        f"video_workers={args.video_workers}",
+        f"video_workers={args.video_workers}, video_mode={args.video_mode}",
         flush=True,
     )
+    print(f"worker logs: {args.worker_logs_dir}/worker_*.log", flush=True)
 
     failures_path = args.output_dir / "failures.jsonl"
     completed = 0
@@ -1173,7 +1308,7 @@ def main() -> int:
                 chunk = pending[start : start + queue_size]
                 futures: Dict[Future[Dict[str, Any]], Dict[str, Any]] = {
                     executor.submit(
-                        process_video,
+                        process_video_logged,
                         video,
                         args,
                         prompt,

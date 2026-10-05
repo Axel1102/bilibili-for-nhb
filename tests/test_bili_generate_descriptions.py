@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import importlib.util
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -183,6 +184,7 @@ def test_asr_failure_forces_video_understanding(
         output_dir=tmp_path,
         overwrite=False,
         retry_partial=False,
+        video_mode="auto",
         cookie_jar=None,
         download_gate=None,
         keep_audio=False,
@@ -208,3 +210,43 @@ def test_asr_failure_forces_video_understanding(
     assert called
     assert called[0]["needs_video_understanding"] is True
     assert result["video_understanding_completed"] is True
+
+
+def test_write_aggregate_creates_video_queue(tmp_path: Path) -> None:
+    result = {
+        "video_id": "BV1",
+        "video_url": "https://www.bilibili.com/video/BV1",
+        "title": "需要画面",
+        "text_description": "文字信息不足",
+        "needs_video_understanding": True,
+        "video_understanding_completed": False,
+        "video_understanding_trigger_reason": "ASR 没有可用转写。",
+        "status": "partial",
+    }
+    generator.write_aggregate(tmp_path, {"BV1": result})
+    queue = [
+        json.loads(line)
+        for line in (tmp_path / "video_understanding_queue.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [row["video_id"] for row in queue] == ["BV1"]
+    assert (tmp_path / "video_understanding_queue.csv").exists()
+
+
+def test_each_thread_writes_a_separate_worker_log(tmp_path: Path) -> None:
+    args = SimpleNamespace(
+        output_dir=tmp_path,
+        worker_logs_dir=tmp_path / "worker_logs",
+    )
+    args.worker_logs_dir.mkdir()
+    thread = threading.Thread(
+        target=generator._worker_log,
+        args=(args, "BV1", "task: start"),
+        name="bili-desc_3",
+    )
+    thread.start()
+    thread.join()
+    assert "[BV1] task: start" in (
+        args.worker_logs_dir / "worker_04.log"
+    ).read_text(encoding="utf-8")
