@@ -162,6 +162,15 @@ def _safe_id(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._") or "unknown"
 
 
+def _requires_video_stage(result: Dict[str, Any]) -> bool:
+    asr = result.get("asr") or {}
+    return (
+        bool(result.get("needs_video_understanding"))
+        or bool(asr.get("error"))
+        or not str(asr.get("transcript") or "").strip()
+    ) and not bool(result.get("video_understanding_completed"))
+
+
 def _worker_log(args: argparse.Namespace, video_id: str, message: str) -> None:
     thread_name = threading.current_thread().name
     match = re.search(r"_(\d+)$", thread_name)
@@ -869,12 +878,7 @@ def process_video(
     existing = _read_json(result_path)
     if existing and not args.overwrite:
         existing_asr = existing.get("asr") or {}
-        needs_video_stage = (
-            bool(existing.get("needs_video_understanding"))
-            or bool(existing_asr.get("error"))
-            or not str(existing_asr.get("transcript") or "").strip()
-        ) and not bool(existing.get("video_understanding_completed"))
-        if needs_video_stage:
+        if _requires_video_stage(existing):
             existing["needs_video_understanding"] = True
             existing["video_understanding_requested"] = True
             existing.setdefault(
@@ -1269,17 +1273,14 @@ def main() -> int:
         if args.overwrite
         or str(video["video_id"]) not in saved
         or (
-            args.video_mode == "auto"
+            _requires_video_stage(saved[str(video["video_id"])])
             and (
-                bool(saved[str(video["video_id"])].get("needs_video_understanding"))
-                or bool((saved[str(video["video_id"])].get("asr") or {}).get("error"))
-                or not str(
-                    (saved[str(video["video_id"])].get("asr") or {}).get("transcript")
-                    or ""
-                ).strip()
-            )
-            and not bool(
-                saved[str(video["video_id"])].get("video_understanding_completed")
+                args.video_mode == "auto"
+                or not bool(
+                    saved[str(video["video_id"])].get(
+                        "video_understanding_requested"
+                    )
+                )
             )
         )
         or (

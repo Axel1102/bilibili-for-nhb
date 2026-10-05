@@ -250,3 +250,13 @@ def test_each_thread_writes_a_separate_worker_log(tmp_path: Path) -> None:
     assert "[BV1] task: start" in (
         args.worker_logs_dir / "worker_04.log"
     ).read_text(encoding="utf-8")
+
+
+def test_old_asr_failure_requires_queue_migration() -> None:
+    assert generator._requires_video_stage(
+        {
+            "needs_video_understanding": False,
+            "video_understanding_completed": False,
+            "asr": {"transcript": "", "error": "download failed"},
+        }
+    )
