@@ -106,6 +106,15 @@ python scripts_lite/bili_generate_descriptions.py \
 
 正式批量处理前建议添加 `--limit 10` 验证 API 额度、下载速度和输出质量。完整 ASR 转写保存在每个视频的 `items/<video_id>/asr.json` 中，汇总文件只保存 description 和状态字段，避免重复存储大段转写。
 
+### 统计 ASR、description 和音频进度
+
+```bash
+python scripts_lite/bili_description_stats.py \
+  --output-dir /path/to/creator_video_catalog_server_ready/descriptions
+```
+
+脚本会自动读取同一数据集下的 `exports/video_metadata.jsonl`，统计输入总数、`result.json`、ASR、非空转写、description、只有 ASR 没有 description、当前仍保留的音频，以及可以确认曾成功下载过音频的视频数。完整统计同时写入 `<output-dir>/description_stats.json`。
+
 可用 `all` 代替 prepare/catalog/crawl 三步。详细说明见：
 
 - [数据结构与参数](docs/bili_creator_pipeline.md)
