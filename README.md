@@ -59,6 +59,10 @@ uv run python scripts_lite/bili_creator_pipeline.py crawl \
 uv run python scripts_lite/bili_creator_stats.py --show unfinished
 ```
 
+统计命令还会生成 `<dataset-root>/reports/creator_progress.csv`。其中包含 UP 主
+UID、用户名、状态、总视频数和已完成视频数；`started`、`catalog_complete`、
+`fully_done` 使用 `1/0` 分别标记“已经开始跑”“视频目录已拉完”和“所有视频内容已爬完”。
+
 ### 多进程并行采集
 
 先用单进程完成 `catalog`，再启动并行采集。每个 worker 使用独立的 Chromium profile，脚本会根据各 UP 主剩余视频数自动均衡分片：
@@ -100,7 +104,26 @@ python scripts_lite/bili_generate_descriptions.py \
 
 `--workers` 是实际工作线程数，`--download-workers` 只限制同时访问 B 站下载音频的线程数。每个线程分别写入 `<output-dir>/worker_logs/worker_*.log`，其中记录音频下载、ASR、文本模型和排队阶段。默认 `--video-mode queue` 不执行视频理解，待处理清单写入 `video_understanding_queue.jsonl` 和 `.csv`。
 
-以后需要自动继续视频理解时可改为 `--video-mode auto`，并用 `--video-workers` 限制同时进行的视频上传与模型调用数。视频理解默认使用 `qwen3.8-omni-flash`，下载视频的最高分辨率为 360p，可通过 `--video-model` 和 `--max-video-height` 调整。默认成功后删除本地音频和低清视频；加 `--keep-audio` 或 `--keep-video` 可保留。
+已经有待处理队列后，可以用独立进程并发消费视频理解任务。它默认只处理磁盘上
+已有 `.video.*` 文件，不访问 B 站，也没有额外请求间隔；线程数就是同时上传和调用
+模型的上限：
+
+```bash
+python scripts_lite/bili_run_video_understanding.py \
+  --output-dir /path/to/creator_video_catalog_server_ready/descriptions \
+  --workers 8
+```
+
+每个线程的日志写入 `<output-dir>/video_worker_logs/worker_*.log`。API 失败默认指数
+退避重试 5 次，每条成功结果立即落盘，因此中断后重复命令即可续跑。磁盘上缺视频的
+条目写入 `video_understanding_missing_files.jsonl`；确实需要补下载时，增加
+`--download-missing --cookie-file /path/to/bilibili.cookie`。脚本默认保留视频，只有显式
+增加 `--delete-video-after-success` 才会在成功后删除。
+
+也可以在主 description 脚本中把 `--video-mode` 改为 `auto`，并用
+`--video-workers` 限制视频阶段。视频理解默认使用 `qwen3.8-omni-flash`，下载缺失视频
+时最高分辨率为 360p，可通过 `--video-model` 和 `--max-video-height` 调整。主脚本默认
+成功后删除本地音频和低清视频；加 `--keep-audio` 或 `--keep-video` 可保留。
 
 汇总结果为 `results.jsonl` 和 `results.csv`。`description_source` 表示最终描述来自 `text` 还是 `video`；`text_description` 保留视频理解前的文本阶段描述。失败项写入 `failures.jsonl`。对其他 `partial` 结果可用 `--retry-partial` 重试。
 

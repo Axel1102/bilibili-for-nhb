@@ -17,6 +17,28 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET_ROOT = PROJECT_ROOT / "data" / "bili" / "creator_dataset"
+CREATOR_CSV_FIELDS = [
+    "creator_id",
+    "creator_name",
+    "batch_index",
+    "state",
+    "started",
+    "catalog_complete",
+    "fully_done",
+    "catalog_video_count",
+    "completed_video_count",
+    "remaining_video_count",
+    "progress_percent",
+    "videos_with_description",
+    "videos_with_comments",
+    "videos_with_sub_comments",
+    "videos_with_danmaku",
+    "comment_count",
+    "sub_comment_count",
+    "danmaku_count",
+    "historical_error_attempts",
+    "last_video_completed_at",
+]
 
 
 def _read_json(path: Path, default: Any = None) -> Any:
@@ -57,6 +79,31 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _atomic_write_creator_csv(path: Path, creators: Iterable[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=CREATOR_CSV_FIELDS, extrasaction="ignore"
+        )
+        writer.writeheader()
+        for creator in creators:
+            catalog_count = int(creator.get("catalog_video_count") or 0)
+            completed_count = int(creator.get("completed_video_count") or 0)
+            writer.writerow(
+                {
+                    **creator,
+                    "started": int(creator.get("state") != "not_started"),
+                    "catalog_complete": int(bool(creator.get("catalog_complete"))),
+                    "fully_done": int(bool(creator.get("fully_done"))),
+                    "remaining_video_count": max(
+                        catalog_count - completed_count, 0
+                    ),
+                }
+            )
     os.replace(temporary, path)
 
 
@@ -413,7 +460,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="report path (default: <dataset-root>/reports/progress_report.json)",
     )
-    parser.add_argument("--no-write", action="store_true", help="print only; do not write a JSON report")
+    parser.add_argument(
+        "--creator-csv",
+        type=Path,
+        default=None,
+        help="creator list path (default: <dataset-root>/reports/creator_progress.csv)",
+    )
+    parser.add_argument(
+        "--no-write",
+        action="store_true",
+        help="print only; do not write JSON or creator CSV reports",
+    )
     parser.add_argument("--skip-disk-size", action="store_true", help="skip recursive disk usage scan")
     return parser
 
@@ -435,6 +492,13 @@ def main() -> int:
         )
         _atomic_write_json(output_path, report)
         print(f"\nJSON report: {output_path}")
+        creator_csv_path = (
+            args.creator_csv.expanduser().resolve()
+            if args.creator_csv
+            else dataset_root / "reports" / "creator_progress.csv"
+        )
+        _atomic_write_creator_csv(creator_csv_path, report["creators"])
+        print(f"Creator CSV: {creator_csv_path}")
     return 0
 
 

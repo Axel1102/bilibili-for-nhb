@@ -783,13 +783,22 @@ def run_video_understanding(
         video_path: Path | None = None
         try:
             with args.video_gate:
-                video_path, download_seconds, video_cached = download_video(
-                    video,
-                    item_dir,
-                    args.cookie_jar,
-                    args.download_gate,
-                    args.max_video_height,
-                )
+                if getattr(args, "local_video_only", False):
+                    video_path = _find_video(item_dir, video_id)
+                    if video_path is None:
+                        raise FileNotFoundError(
+                            f"Local video not found for {video_id}"
+                        )
+                    download_seconds = 0.0
+                    video_cached = True
+                else:
+                    video_path, download_seconds, video_cached = download_video(
+                        video,
+                        item_dir,
+                        args.cookie_jar,
+                        args.download_gate,
+                        args.max_video_height,
+                    )
                 _worker_log(
                     args,
                     video_id,

@@ -111,6 +111,34 @@ def test_video_command_limits_resolution(tmp_path: Path) -> None:
     assert "--cookies" in command
 
 
+def test_local_video_only_never_downloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        generator,
+        "download_video",
+        lambda *args, **kwargs: pytest.fail("must not download"),
+    )
+    args = SimpleNamespace(
+        output_dir=tmp_path,
+        worker_logs_dir=tmp_path / "logs",
+        overwrite=False,
+        video_gate=threading.BoundedSemaphore(1),
+        local_video_only=True,
+        keep_video=True,
+    )
+    with pytest.raises(FileNotFoundError, match="Local video not found"):
+        generator.run_video_understanding(
+            {"video_id": "BV1"},
+            {"video_id": "BV1"},
+            tmp_path / "items" / "BV1",
+            tmp_path / "items" / "BV1" / "result.json",
+            args,
+            "prompt",
+            "key",
+        )
+
+
 def test_validate_model_result_requires_reason() -> None:
     with pytest.raises(ValueError, match="reason"):
         generator.validate_model_result(
