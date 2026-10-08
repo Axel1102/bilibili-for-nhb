@@ -138,6 +138,22 @@ python scripts_lite/bili_description_stats.py \
 
 脚本会自动读取同一数据集下的 `exports/video_metadata.jsonl`，统计输入总数、`result.json`、ASR、非空转写、description、只有 ASR 没有 description、当前仍保留的音频，以及可以确认曾成功下载过音频的视频数。完整统计同时写入 `<output-dir>/description_stats.json`。
 
+### 打包 description 结果
+
+下面的命令会打包项目代码和 description 相关结果。它直接遍历文件系统，因此普通的
+Git ignore 文件（例如日志）也会进入压缩包；但会排除 `batches/`、`data/`、完整视频、
+音频、Cookie、`.env`、浏览器 profile、虚拟环境和缓存：
+
+```bash
+python scripts_lite/bili_package_descriptions.py \
+  --dataset-root /path/to/creator_video_catalog_server_ready
+```
+
+压缩包默认生成在项目目录的上一级，文件名形如
+`bilibili_description_bundle_20261008_120000.zip`。除了 `descriptions/`，还会包含
+`exports/`、`reports/` 和 `inputs/`。如需同时保留 ASR 音频，可显式增加
+`--include-audio`；完整视频始终不会打包。脚本完成后会自动校验 ZIP 完整性。
+
 可用 `all` 代替 prepare/catalog/crawl 三步。详细说明见：
 
 - [数据结构与参数](docs/bili_creator_pipeline.md)
